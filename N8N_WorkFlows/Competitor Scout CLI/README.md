@@ -1,4 +1,3 @@
-````markdown
 # Competitor Scout (n8n Workflow) — Beginner Setup & Run Guide
 
 This repository/workflow lets you research competitor feature decisions (e.g., “What sign-in methods do my competitors use?”) using:
