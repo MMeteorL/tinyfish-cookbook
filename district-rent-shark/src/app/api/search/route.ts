@@ -7,20 +7,27 @@ import {
   RunStatus,
   TinyFish,
   type ProxyConfig,
-  type ProxyCountryCode,
 } from "@tiny-fish/sdk";
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { sanitizeListingResultThumbnails } from "@/lib/listing-thumbnail";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 const REQUEST_TIMEOUT_MS = 780_000;
-const REQUEST_STAGGER_MS = 0;
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
 const TINYFISH_PROXY_CONFIG: ProxyConfig = {
   enabled: true,
-  country_code: "VN" as unknown as ProxyCountryCode,
+};
+
+const ENABLE_FETCH_FIRST_PIPELINE =
+  process.env.TINYFISH_FETCH_FIRST_PIPELINE === "1";
+
+const CITY_DISPLAY_NAME: Record<string, string> = {
+  hcmc: "Ho Chi Minh City",
+  hanoi: "Hanoi",
+  danang: "Da Nang",
 };
 
 const CITY_SITES: Record<string, string[]> = {
@@ -66,7 +73,11 @@ Steps:
    - amenities: Array of amenities in English (e.g. ["air conditioning", "washing machine", "parking"])
    - description_en: First 200 chars of description, TRANSLATED to English
    - listing_url: Direct URL to this specific listing
-   - thumbnail_url: URL of the listing's main image/thumbnail
+   - thumbnail_url: URL of the LISTING'S MAIN PROPERTY PHOTO (not the publisher/broker avatar)
+     * For Batdongsan, there is often a small circular/square "avatar/profile" image for the poster — DO NOT use that.
+     * Prefer the large property photo shown in the listing card/gallery (main listing image).
+     * Small "/resize/200x200/" URLs are often still the property photo on listing cards; include them in thumbnail_candidates if they show the room/apartment.
+   - thumbnail_candidates: REQUIRED whenever the listing row shows any property photo: 1–10 absolute https URLs (main card image first, then other property shots). Copy hrefs/src from <img> in that listing's row/card. NEVER omit this array when a room/building photo is visible — the UI depends on it. Exclude only the poster's tiny circular avatar and generic site logos.
    - trust_signals: An object with:
      * is_likely_broker: boolean — true if poster seems to be a broker
      * is_repost: boolean — true if listing appears to be reposted (check for duplicate indicators)
@@ -80,7 +91,7 @@ Steps:
      * notes: string or null — any other building rules mentioned
 
 4. TRANSLATE all Vietnamese text to English in the output fields marked with _en suffix.
-5. If a field is not available on the page, use null for optional fields.
+5. If a field is not available on the page, use null for optional fields (except thumbnail_candidates: use [] only when the listing truly has no property image at all).
 
 Return a JSON object with this exact structure:
 {
@@ -102,6 +113,7 @@ Return a JSON object with this exact structure:
       "description_en": "Beautiful apartment in the heart of District 1...",
       "listing_url": "https://example.com/listing/123",
       "thumbnail_url": "https://example.com/images/123.jpg",
+      "thumbnail_candidates": ["https://example.com/images/123.jpg"],
       "trust_signals": {
         "is_likely_broker": false,
         "is_repost": false,
@@ -138,12 +150,62 @@ interface CacheRow {
 // Utility helpers
 // ---------------------------------------------------------------------------
 
-void REQUEST_STAGGER_MS; // acknowledged — no staggering by design
-
 const sseData = (payload: unknown) => `data: ${JSON.stringify(payload)}\n\n`;
 
 const elapsedSeconds = (startedAt: number) =>
   ((Date.now() - startedAt) / 1000).toFixed(1);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function getHostname(url: string): string {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function guessPlatformFromUrl(url: string): "chotot" | "batdongsan" | "unknown" {
+  const host = getHostname(url);
+  if (host.includes("chotot.com")) return "chotot";
+  if (host.includes("batdongsan.com.vn")) return "batdongsan";
+  return "unknown";
+}
+
+type ListingResult = {
+  platform: string;
+  city: string;
+  listings: unknown[];
+};
+
+type TinyFishRunResult = { result?: unknown; error?: { message?: string } | string };
+
+function validateListingResult(value: unknown): value is ListingResult {
+  if (!isRecord(value)) return false;
+  if (typeof value.platform !== "string" || value.platform.length < 2) return false;
+  if (typeof value.city !== "string" || value.city.length < 2) return false;
+  if (!Array.isArray(value.listings)) return false;
+  if (value.listings.length < 5) return false;
+
+  for (const listing of value.listings) {
+    if (!isRecord(listing)) return false;
+    // Minimal schema gate — ensures we don't return empty/garbled extraction.
+    if (typeof listing.title_en !== "string" || listing.title_en.length < 2) return false;
+    if (typeof listing.listing_url !== "string" || !listing.listing_url.startsWith("http"))
+      return false;
+    if (
+      typeof listing.price_vnd_monthly !== "number" ||
+      !Number.isFinite(listing.price_vnd_monthly) ||
+      listing.price_vnd_monthly <= 0
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
 
 // ---------------------------------------------------------------------------
 // Supabase cache helpers (all gracefully degrade on failure)
@@ -209,10 +271,141 @@ async function cacheResult(
 }
 
 // ---------------------------------------------------------------------------
-// TinyFish SSE scraper
+// TinyFish pipelines
 // ---------------------------------------------------------------------------
 
-async function runTinyFishSseForSite(
+async function discoverFallbackUrls(
+  client: TinyFish,
+  platform: "chotot" | "batdongsan" | "unknown",
+  cityKey: string,
+): Promise<string[]> {
+  const cityName = CITY_DISPLAY_NAME[cityKey] || cityKey;
+  const query =
+    platform === "chotot"
+      ? `site:chotot.com thuê phòng trọ ${cityName}`
+      : platform === "batdongsan"
+        ? `site:batdongsan.com.vn cho thuê căn hộ ${cityName}`
+        : `thuê phòng trọ ${cityName}`;
+
+  try {
+    const resp = await client.search.query({
+      query,
+      location: "VN",
+      language: "vi",
+    });
+
+    const allowedHost =
+      platform === "chotot"
+        ? "chotot.com"
+        : platform === "batdongsan"
+          ? "batdongsan.com.vn"
+          : null;
+
+    const urls =
+      resp.results
+        ?.map((r) => r.url)
+        .filter((u): u is string => typeof u === "string" && u.startsWith("http")) ?? [];
+
+    const filtered = allowedHost
+      ? urls.filter((u) => getHostname(u).includes(allowedHost))
+      : urls;
+
+    // Limit retries to keep latency bounded.
+    return Array.from(new Set(filtered)).slice(0, 2);
+  } catch (err) {
+    console.error("[RENT] [SEARCH] Fallback discovery failed:", err);
+    return [];
+  }
+}
+
+async function runFetchThenExtractForSite(
+  client: TinyFish,
+  url: string,
+  cityDisplayName: string,
+): Promise<unknown | null> {
+  // 1) Fetch page text
+  const fetchRes = await client.fetch.getContents({
+    urls: [url],
+    format: "markdown",
+  });
+
+  const page = fetchRes.results?.[0];
+  const pageText = page?.text;
+  if (typeof pageText !== "string" || pageText.trim().length < 200) {
+    return null;
+  }
+
+  // 2) Extract structured JSON using an agent run over the rendered text.
+  // We keep this in TinyFish infra for parity with existing extraction quality.
+  const extractorGoal = `You are extracting rental apartment/room listings from pre-rendered page content.
+
+Input is MARKDOWN content from a Vietnamese real estate site. It may include navigation, banners, and repeated sections.
+
+TASK:
+- Identify the first 10 rental listings visible on the page content.
+- Translate Vietnamese text into English for fields with _en suffix.
+- For thumbnail_url: return the LISTING'S MAIN PROPERTY PHOTO, not any publisher/broker avatar/profile picture.
+- For thumbnail_candidates: REQUIRED (non-empty) whenever the markdown shows a property image for that listing — copy every plausible property image URL from that listing's block (best first). Include "/resize/..." CDN URLs. Use [] only if there is truly no property image.
+- Return a JSON object with this exact structure:
+{
+  "platform": "Name of the website (e.g. 'Cho Tot', 'Bat Dong San')",
+  "city": "${cityDisplayName}",
+  "listings": [
+    {
+      "title_en": "...",
+      "price_vnd_monthly": 8000000,
+      "area_m2": 45,
+      "address_en": "...",
+      "district": "...",
+      "bedrooms": 1,
+      "bathrooms": 1,
+      "post_date": "...",
+      "poster_name": "...",
+      "poster_type": "owner" | "broker" | "unknown",
+      "amenities": ["..."],
+      "description_en": "...",
+      "listing_url": "https://...",
+      "thumbnail_url": "https://...",
+      "thumbnail_candidates": ["https://..."],
+      "trust_signals": {
+        "is_likely_broker": false,
+        "is_repost": false,
+        "price_suspicious": false,
+        "deposit_mentioned": true,
+        "deposit_terms": "..."
+      },
+      "building_rules": {
+        "pets_allowed": "yes" | "no" | "unknown",
+        "parking": "...",
+        "curfew": "...",
+        "notes": "..."
+      }
+    }
+  ]
+}
+
+IMPORTANT:
+- Return VALID JSON ONLY. No markdown. No commentary.
+- If a field is not available, use null (except arrays, use []).
+- listing_url must be an absolute URL.
+
+PAGE MARKDOWN:
+${pageText}`;
+
+  const run = await client.agent.run({
+    url: "about:blank",
+    goal: extractorGoal,
+    browser_profile: BrowserProfile.LITE,
+    proxy_config: TINYFISH_PROXY_CONFIG,
+  });
+
+  const runResult = run as unknown as TinyFishRunResult;
+  if (runResult.error) return null;
+  return runResult.result ?? null;
+}
+
+async function runTinyFishStreamForSite(
+  client: TinyFish,
   url: string,
   enqueue: (payload: unknown) => void,
 ): Promise<boolean> {
@@ -220,7 +413,6 @@ async function runTinyFishSseForSite(
   console.log(`[RENT] [TINYFISH] Starting: ${url}`);
 
   try {
-    const client = new TinyFish({ timeout: REQUEST_TIMEOUT_MS });
     const stream = await client.agent.stream({
       url,
       goal: GOAL_PROMPT,
@@ -261,7 +453,7 @@ async function runTinyFishSseForSite(
       enqueue({
         type: "LISTING_RESULT",
         siteUrl: url,
-        data: resultJson,
+        data: sanitizeListingResultThumbnails(resultJson),
       });
       console.log(
         `[RENT] [TINYFISH] Complete: ${url}${runId ? ` [${runId}]` : ""} (${elapsedSeconds(startedAt)}s)`,
@@ -274,6 +466,66 @@ async function runTinyFishSseForSite(
     console.error(`[RENT] [TINYFISH] Failed: ${url}`, error);
     return false;
   }
+}
+
+async function runSiteWithFetchExtractorAndFallbacks(
+  client: TinyFish,
+  url: string,
+  cityKey: string,
+  enqueue: (payload: unknown) => void,
+): Promise<boolean> {
+  const cityDisplayName = CITY_DISPLAY_NAME[cityKey] || cityKey;
+  const platform = guessPlatformFromUrl(url);
+
+  // Canary flag: default to legacy Agent-streaming path unless enabled.
+  if (!ENABLE_FETCH_FIRST_PIPELINE) {
+    return runTinyFishStreamForSite(client, url, enqueue);
+  }
+
+  // ---- Attempt 1: Fetch → extract ----
+  try {
+    const extracted = await runFetchThenExtractForSite(client, url, cityDisplayName);
+    if (validateListingResult(extracted)) {
+      enqueue({
+        type: "LISTING_RESULT",
+        siteUrl: url,
+        data: sanitizeListingResultThumbnails(extracted),
+      });
+      return true;
+    }
+  } catch (err) {
+    console.warn(`[RENT] [FETCH] Failed for ${url}:`, err);
+  }
+
+  // ---- Attempt 2: Agent streaming on original URL ----
+  const ok = await runTinyFishStreamForSite(client, url, enqueue);
+  if (ok) return true;
+
+  // ---- Attempt 3: Search API fallback (only on failure) ----
+  const fallbacks = await discoverFallbackUrls(client, platform, cityKey);
+  for (const altUrl of fallbacks) {
+    if (altUrl === url) continue;
+    console.warn(`[RENT] [SEARCH] Retrying with fallback URL: ${altUrl}`);
+
+    try {
+      const extracted = await runFetchThenExtractForSite(client, altUrl, cityDisplayName);
+      if (validateListingResult(extracted)) {
+        enqueue({
+          type: "LISTING_RESULT",
+          siteUrl: altUrl,
+          data: sanitizeListingResultThumbnails(extracted),
+        });
+        return true;
+      }
+    } catch (err) {
+      console.warn(`[RENT] [FETCH] Failed for fallback ${altUrl}:`, err);
+    }
+
+    const okAlt = await runTinyFishStreamForSite(client, altUrl, enqueue);
+    if (okAlt) return true;
+  }
+
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -346,11 +598,13 @@ export async function POST(request: Request): Promise<Response> {
         controller.enqueue(encoder.encode(sseData(payload)));
       };
 
+      const tinyfish = new TinyFish({ timeout: REQUEST_TIMEOUT_MS });
+
       // ---- Stream cached results instantly ----
       for (const { row } of cachedSites) {
         enqueue({
           type: "LISTING_RESULT",
-          data: row.listing_data,
+          data: sanitizeListingResultThumbnails(row.listing_data),
           source: "cache",
           cached_at: row.scraped_at,
         });
@@ -376,7 +630,7 @@ export async function POST(request: Request): Promise<Response> {
               }
             };
 
-            return runTinyFishSseForSite(url, siteEnqueue);
+            return runSiteWithFetchExtractorAndFallbacks(tinyfish, url, city, siteEnqueue);
           })(),
         );
 

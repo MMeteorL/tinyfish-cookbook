@@ -7,7 +7,6 @@ import {
   RunStatus,
   TinyFish,
   type ProxyConfig,
-  type ProxyCountryCode,
 } from "@tiny-fish/sdk";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
@@ -20,7 +19,6 @@ const REQUEST_STAGGER_MS = 2000; // 2s between districts — Google Maps anti-bo
 const CACHE_TTL_MS = 48 * 60 * 60 * 1000; // 48 hours — vibe data changes slowly
 const TINYFISH_PROXY_CONFIG: ProxyConfig = {
   enabled: true,
-  country_code: "VN" as unknown as ProxyCountryCode,
 };
 
 const CITY_DISTRICTS: Record<
