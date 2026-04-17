@@ -8,15 +8,16 @@
 
 ## What it does
 
-Finding apartments in Vietnam means visiting 2-3 different websites, each with different layouts, Vietnamese-only listings, and no way to compare prices or trust signals. This app sends TinyFish browser agents to Chợ Tốt and batdongsan.com.vn **simultaneously**, extracts structured rental data with English translations, and streams results to an interactive dashboard in real time.
+Finding apartments in Vietnam means visiting several websites, each with different layouts, Vietnamese-only listings, and no easy way to compare prices or trust signals. This app sends TinyFish browser agents to Chợ Tốt and batdongsan.com.vn **in parallel**, extracts structured rental data with English translations, and streams results to the dashboard in real time.
 
-- Search across **3 cities** — HCMC, Hanoi, Da Nang
-- **Trust scoring** — detects brokers, reposts, suspicious pricing, and deposit terms
-- **Building rules** — pets, parking, curfew, and other restrictions extracted from listings
-- **Neighborhood vibe** — Google Maps integration for walkability, transit, and local vibes
-- **Interactive Mapbox** — visualize listings on a map with filters
-- Toggle between **live scraping** and **cached results** (6-hour TTL)
-- Results stream in as each site completes — no waiting for the slowest one
+- Search across **3 cities** — HCMC, Hanoi, Da Nang (up to **4 parallel city slots** in the UI)
+- **Trust scoring** — brokers, suspicious pricing, and related signals (`src/lib/normalize.ts`)
+- **Building rules** — pets, parking, curfew, and notes from listings
+- **Neighborhood vibe** — Google Maps–driven summaries per district (`/api/vibe`)
+- **Mapbox** — optional map when `NEXT_PUBLIC_MAPBOX_TOKEN` is set
+- Toggle **live scraping** vs **cached results** (6-hour TTL in Supabase)
+- **Thumbnails** — after extraction, `src/lib/listing-thumbnail.ts` merges `thumbnail_url`, `thumbnail_candidates`, nested image fields, and URLs found in text, picks the best property image (not poster avatars when alternatives exist), and upgrades small `/resize/` CDN paths when possible
+- Results stream over **SSE** as each site finishes
 
 ---
 
@@ -32,64 +33,24 @@ Finding apartments in Vietnam means visiting 2-3 different websites, each with d
 User clicks Search
        │
        ▼
-POST /api/search
+POST /api/search  { city, useCache? }
        │
-       ├── Cache hit? → stream result instantly via SSE
+       ├── Cache hit? → stream LISTING_RESULT immediately (payload run through thumbnail sanitizer)
        │
-        └── Cache miss? → fire TinyFish SSE requests for all sites in parallel
+       └── Cache miss? → TinyFish agent.stream per site URL (parallel)
                               │
-                              ├── STREAMING_URL event → forward iframe URL to client
+                              ├── STREAMING_URL → client can show live browser preview iframes
                               │
-                              └── COMPLETED event → parse JSON, stream to client, upsert to cache
+                              └── COMPLETE → JSON sanitized (thumbnails) → LISTING_RESULT → optional cache upsert
 ```
 
-Each city has 2 target sites (Chợ Tốt and batdongsan). TinyFish handles all the hard parts: cookie banners, dynamic loading, Vietnamese-to-English translation, pagination. The API route streams results via **Server-Sent Events** so the UI updates as sites finish — typically within 30-60 seconds for a full city scrape.
+Each city targets **two** listing URLs (Chợ Tốt + batdongsan). The API uses the **Node.js** runtime with a long timeout so agents can finish. Optional `TINYFISH_FETCH_FIRST_PIPELINE=1` enables a fetch-then-extract path before falling back to the streaming agent.
 
 ---
 
-## TinyFish SDK snippet
+## TinyFish SDK (search route)
 
-Here's the core SDK stream from `/api/search/route.ts` (goal prompt truncated):
-
-```typescript
-import { TinyFish } from "@tiny-fish/sdk";
-
-const GOAL_PROMPT = `You are extracting rental apartment/room listings from a Vietnamese real estate website.
-
-Steps:
-1. Wait for the page content to fully render — these are JavaScript SPAs that load content dynamically.
-2. Handle any popups, cookie banners, or login modals by dismissing/closing them.
-3. Extract the first 10 rental listings visible on the page. For each listing, extract ALL of the following fields:
-   - title_en, price_vnd_monthly, area_m2, address_en, district, bedrooms, bathrooms
-   - post_date, poster_name, poster_type, amenities, description_en, listing_url, thumbnail_url
-   - trust_signals: is_likely_broker, is_repost, price_suspicious, deposit_mentioned, deposit_terms
-   - building_rules: pets_allowed, parking, curfew, notes
-
-4. TRANSLATE all Vietnamese text to English in the output fields marked with _en suffix.
-5. Return a JSON object with platform, city, and listings[] array.`;
-
-async function runTinyFishSseForSite(url: string, enqueue: (payload: unknown) => void): Promise<boolean> {
-  const client = new TinyFish({ timeout: 780_000 });
-  const stream = await client.agent.stream({
-    url,
-    goal: GOAL_PROMPT,
-    browser_profile: "stealth",
-    proxy_config: {
-      enabled: true,
-      country_code: "VN",
-    },
-  });
-
-  for await (const event of stream) {
-    if (event.type === "STREAMING_URL") {
-      enqueue({ type: "STREAMING_URL", streamingUrl: event.streaming_url });
-    }
-    if (event.type === "COMPLETE" && event.status === "COMPLETED") {
-      enqueue({ type: "LISTING_RESULT", data: event.result });
-    }
-  }
-}
-```
+The search handler uses `@tiny-fish/sdk` with stealth browser profile and proxy enabled (see `src/app/api/search/route.ts`). Events include `STREAMING_URL` (with `siteUrl` + `streamingUrl`) and `COMPLETE` with structured listing JSON. Listing payloads are passed through `sanitizeListingResultThumbnails()` before being sent to the client or cached.
 
 ---
 
@@ -107,13 +68,16 @@ Create a `.env.local` file:
 # Required
 TINYFISH_API_KEY=your_key_here
 
-# Optional — for result caching (app works fine without it)
+# Optional
 NEXT_PUBLIC_MAPBOX_TOKEN=your_mapbox_token
 NEXT_PUBLIC_SUPABASE_URL=your_supabase_url
 SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
+
+# Optional — use fetch → LLM extract before full browser agent (see route)
+# TINYFISH_FETCH_FIRST_PIPELINE=1
 ```
 
-Get a TinyFish API key at [tinyfish.ai](https://tinyfish.ai/).
+Get a TinyFish API key at [tinyfish.ai](https://tinyfish.ai/). Supabase is only needed for caching; search works without it.
 
 ```bash
 npm run dev
@@ -129,28 +93,39 @@ Open [http://localhost:3000](http://localhost:3000).
 graph TD
   Browser -->|POST /api/search| SearchAPI[Search API Route]
   Browser -->|POST /api/vibe| VibeAPI[Vibe API Route]
-  SearchAPI -->|SSE| TF1[TinyFish: Chợ Tốt]
-  SearchAPI -->|SSE| TF2[TinyFish: batdongsan]
-  VibeAPI -->|SSE| TF3[TinyFish: Google Maps]
-  SearchAPI -.->|cache| SB1[(Supabase rental_cache)]
-  VibeAPI -.->|cache| SB2[(Supabase vibe_cache)]
+  SearchAPI -->|SSE| TF1[TinyFish agents]
+  VibeAPI -->|SSE| TF2[TinyFish: Google Maps]
+  SearchAPI --> Thumb[listing-thumbnail sanitizer]
+  SearchAPI -.->|optional| SB1[(Supabase rental_cache)]
+  VibeAPI -.->|optional| SB2[(Supabase vibe_cache)]
 ```
 
 ---
 
 ## Tech stack
 
-| Layer | Choice | Why |
-|---|---|---|
-| Framework | Next.js 16 (App Router) | SSE streaming via Node.js runtime |
-| UI | React 19 + Tailwind CSS 4 + shadcn/ui | Fast, clean, no design system overhead |
-| Scraping | [TinyFish API](https://tinyfish.ai/) | Parallel browser agents, structured JSON output, Vietnamese translation |
-| Mapping | Mapbox GL | Interactive map visualization with filters |
-| Validation | Zod | Type-safe schema validation for listing data |
-| Caching | Supabase (Postgres) | 6-hour TTL, graceful degradation if unavailable |
-| Testing | Vitest | Fast unit tests for data parsing and trust scoring |
-| Hosting | Vercel | Zero-config, auto-deploys |
+| Layer | Choice | Notes |
+| --- | --- | --- |
+| Framework | Next.js 16 (App Router) | API routes use `nodejs` runtime for SSE |
+| UI | React 19 + Tailwind CSS 4 + shadcn/ui | |
+| Scraping | [TinyFish API](https://tinyfish.ai/) | `@tiny-fish/sdk` |
+| Mapping | Mapbox GL | Optional (`NEXT_PUBLIC_MAPBOX_TOKEN`) |
+| Env validation | Zod | `src/lib/env.ts` for optional strict Supabase env |
+| Caching | Supabase (Postgres) | Graceful degradation if unset |
+| Testing | Vitest | Parsing, trust scoring, thumbnail selection |
 
 ---
 
-Built as a take-home demo for [TinyFish](https://tinyfish.ai) — showing what's possible when you give TinyFish a list of niche local websites and let it run in parallel.
+## Scripts
+
+| Command | Description |
+| --- | --- |
+| `npm run dev` | Development server |
+| `npm run build` | Production build |
+| `npm run start` | Run production server |
+| `npm test` | Vitest |
+| `npm run lint` | ESLint |
+
+---
+
+Built as a demo for [TinyFish](https://tinyfish.ai) — parallel browser agents on local listing sites with a streamed English-first UI.
